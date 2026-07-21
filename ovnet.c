@@ -2,7 +2,7 @@
  * oplus_network_vnet.ko — Virtual Network Interface Driver
  *
  * Reverse-engineered from OPD2404 16.0.5.702 oplus_network_vnet.ko
- * Reimplemented for Linux 4.19 kernel (TB371FC TB371FC 4.19.157-perf+)
+ * Reimplemented for Linux 4.19 kernel (TB371FC 4.19.157-perf+)
  *
  * Function: Creates ovnet%d virtual interfaces that bind to physical
  * network interfaces (e.g. wlan0) and forward packets via neigh_xmit.
@@ -11,7 +11,6 @@
  * Original vermagic: 6.1.68-android14-11-o-g4a4638c23eb0
  * Target vermagic:   4.19.157-perf+
  *
- * Build: see Makefile and build.sh
  * License: GPL
  */
 
@@ -51,12 +50,14 @@ MODULE_PARM_DESC(numvnets, "Number of ovnet devices");
 
 /* ============================================================
  * Per-device private data
+ * In 4.19 kernel, u64_stats_t does not exist — use plain u64
+ * with struct u64_stats_sync for seqcount protection.
  * ============================================================ */
 struct ovnet_stats {
-	u64_stats_t tx_packets;
-	u64_stats_t tx_bytes;
-	u64_stats_t rx_packets;
-	u64_stats_t rx_bytes;
+	u64 tx_packets;
+	u64 tx_bytes;
+	u64 rx_packets;
+	u64 rx_bytes;
 	struct u64_stats_sync syncp;
 };
 
@@ -76,17 +77,18 @@ static LIST_HEAD(ovnet_dev_list);
 static DEFINE_SPINLOCK(ovnet_lock);
 
 /* ============================================================
- * Statistics
+ * Statistics — 4.19 compatible (no u64_stats_set/read/inc/add)
  * ============================================================ */
 static void ovnet_stats_init(struct ovnet_dev *ovnet)
 {
 	int cpu;
 	for_each_possible_cpu(cpu) {
 		struct ovnet_stats *s = per_cpu_ptr(ovnet->stats, cpu);
-		u64_stats_set(&s->tx_packets, 0);
-		u64_stats_set(&s->tx_bytes, 0);
-		u64_stats_set(&s->rx_packets, 0);
-		u64_stats_set(&s->rx_bytes, 0);
+		/* In 4.19, just direct-assign during init (no concurrency yet) */
+		s->tx_packets = 0;
+		s->tx_bytes = 0;
+		s->rx_packets = 0;
+		s->rx_bytes = 0;
 	}
 }
 
@@ -103,10 +105,11 @@ static struct rtnl_link_stats64 *ovnet_get_stats64(struct net_device *dev,
 
 		do {
 			start = u64_stats_fetch_begin_irq(&s->syncp);
-			tx_packets = u64_stats_read(&s->tx_packets);
-			tx_bytes = u64_stats_read(&s->tx_bytes);
-			rx_packets = u64_stats_read(&s->rx_packets);
-			rx_bytes = u64_stats_read(&s->rx_bytes);
+			/* 4.19: direct read instead of u64_stats_read() */
+			tx_packets = s->tx_packets;
+			tx_bytes = s->tx_bytes;
+			rx_packets = s->rx_packets;
+			rx_bytes = s->rx_bytes;
 		} while (u64_stats_fetch_retry_irq(&s->syncp, start));
 
 		tot->tx_packets += tx_packets;
@@ -141,8 +144,9 @@ static unsigned int ovnet_dev_ingress_hook(void *priv,
 
 			s = this_cpu_ptr(ovnet->stats);
 			u64_stats_update_begin(&s->syncp);
-			u64_stats_inc(&s->rx_packets);
-			u64_stats_add(&s->rx_bytes, skb->len);
+			/* 4.19: direct increment instead of u64_stats_inc() */
+			s->rx_packets++;
+			s->rx_bytes += skb->len;
 			u64_stats_update_end(&s->syncp);
 
 			netif_rx(skb);
@@ -166,7 +170,8 @@ static int ovnet_open(struct net_device *dev)
 	/* Register ingress hook if we have a bound device */
 	if (ovnet->bind_dev && !ovnet->hook_registered) {
 		ovnet->ingress_hook.hook = ovnet_dev_ingress_hook;
-		ovnet->ingress_hook.hook_ops_type = NF_NETDEV_INGRESS;
+		/* 4.19: use hooknum instead of hook_ops_type */
+		ovnet->ingress_hook.hooknum = NF_NETDEV_INGRESS;
 		ovnet->ingress_hook.pf = NFPROTO_NETDEV;
 		ovnet->ingress_hook.dev = ovnet->bind_dev;
 
@@ -201,15 +206,14 @@ static netdev_tx_t ovnet_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct ovnet_dev *ovnet = netdev_priv(dev);
 	struct ovnet_stats *s;
-	struct neighbour *neigh;
 	struct net_device *tdev;
-	__be32 ip;
 	int ret;
 
 	s = this_cpu_ptr(ovnet->stats);
 	u64_stats_update_begin(&s->syncp);
-	u64_stats_inc(&s->tx_packets);
-	u64_stats_add(&s->tx_bytes, skb->len);
+	/* 4.19: direct increment instead of u64_stats_inc()/u64_stats_add() */
+	s->tx_packets++;
+	s->tx_bytes += skb->len;
 	u64_stats_update_end(&s->syncp);
 
 	/* If no bound device, just drop */
@@ -220,22 +224,24 @@ static netdev_tx_t ovnet_xmit(struct sk_buff *skb, struct net_device *dev)
 		return NETDEV_TX_OK;
 	}
 
-	/* Get destination IP and find neighbour on the bound device */
+	/* Forward via neigh_xmit on bound device.
+	 * 4.19: use NEIGH_ARP_TABLE / NEIGH_ND_TABLE constants directly,
+	 * avoiding ipv6_stub dependency (not EXPORT_SYMBOL'd for modules).
+	 */
 	if (skb->protocol == htons(ETH_P_IP)) {
 		struct iphdr *iph = ip_hdr(skb);
 		if (!iph) {
 			kfree_skb(skb);
 			return NETDEV_TX_OK;
 		}
-		ip = iph->daddr;
-		neigh = neigh_lookup(&arp_tbl, &ip, tdev);
+		ret = neigh_xmit(NEIGH_ARP_TABLE, tdev, &iph->daddr, skb);
 	} else if (skb->protocol == htons(ETH_P_IPV6)) {
 		struct ipv6hdr *iph6 = ipv6_hdr(skb);
 		if (!iph6) {
 			kfree_skb(skb);
 			return NETDEV_TX_OK;
 		}
-		neigh = neigh_lookup(ipv6_stub->nd_tbl, &iph6->daddr, tdev);
+		ret = neigh_xmit(NEIGH_ND_TABLE, tdev, &iph6->daddr, skb);
 	} else {
 		/* Non-IP: just forward directly */
 		skb->dev = tdev;
@@ -243,19 +249,9 @@ static netdev_tx_t ovnet_xmit(struct sk_buff *skb, struct net_device *dev)
 		return NETDEV_TX_OK;
 	}
 
-	if (!neigh) {
-		pr_debug("OVNET:cannot find redirect device for %u, dropping\n",
-			 tdev->ifindex);
-		kfree_skb(skb);
-		return NETDEV_TX_OK;
-	}
-
-	/* Forward via neighbour on bound device */
-	ret = neigh_xmit(NEIGH_ARP_TABLE, tdev, &ip, skb);
 	if (ret)
 		pr_debug("OVNET:ovnet_xmit skb %s return %d\n", dev->name, ret);
 
-	neigh_release(neigh);
 	return NETDEV_TX_OK;
 }
 
@@ -413,7 +409,8 @@ static int ovnet_changelink(struct net_device *dev, struct nlattr *tb[],
 		if (ovnet->bind_dev && netif_running(dev)) {
 			ovnet->ingress_hook.hook = ovnet_dev_ingress_hook;
 			ovnet->ingress_hook.pf = NFPROTO_NETDEV;
-			ovnet->ingress_hook.hook_ops_type = NF_NETDEV_INGRESS;
+			/* 4.19: use hooknum instead of hook_ops_type */
+			ovnet->ingress_hook.hooknum = NF_NETDEV_INGRESS;
 			ovnet->ingress_hook.dev = ovnet->bind_dev;
 			if (nf_register_net_hook(dev_net(dev), &ovnet->ingress_hook) == 0)
 				ovnet->hook_registered = true;
