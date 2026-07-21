@@ -1,0 +1,44 @@
+name: Build ovnet.ko for TB371FC
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout ovnet source
+        uses: actions/checkout@v4
+
+      - name: Install cross-compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential gcc-aarch64-linux-gnu \
+            bc bison flex libssl-dev libncurses-dev cpio kmod
+
+      - name: Clone TB371FC kernel source
+        run: |
+          git clone --depth=1 --branch tb371fc-desktop-linux \
+            https://github.com/ila-embsys/linux-android-msm-lenovo-p12.git kernel
+          head -5 kernel/Makefile
+
+      - name: Configure kernel
+        run: |
+          cd kernel
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- prepare
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_prepare
+
+      - name: Build ovnet module
+        run: |
+          cp Makefile.module Makefile
+          make KDIR=$GITHUB_WORKSPACE/kernel ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+          file oplus_network_vnet.ko
+          modinfo oplus_network_vnet.ko || true
+
+      - name: Upload ovnet.ko
+        uses: actions/upload-artifact@v4
+        with:
+          name: oplus_network_vnet.ko
+          path: oplus_network_vnet.ko
+          retention-days: 90
