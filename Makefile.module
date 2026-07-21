@@ -1,0 +1,15 @@
+obj-m := oplus_network_vnet.o
+oplus_network_vnet-objs := ovnet.o
+
+ccflags-y := -Wall -Wno-unused-variable -Wno-unused-function \
+             -DCONFIG_OPLUS_NETWORK_VNET=1
+
+all: modules
+
+modules:
+	$(MAKE) -C $(KDIR) M=$(CURDIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(CURDIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) clean
+
+.PHONY: all clean
